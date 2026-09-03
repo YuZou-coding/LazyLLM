@@ -89,6 +89,24 @@ def generate_lazyllm_tool(client, mcp_tool) -> Callable:
 
     # Define the function
     def dynamic_lazyllm_func(**kwargs):
+        try:
+            import lazyllm
+            from lazyllm.tools.agent import ToolExecutionError
+            config = lazyllm.globals.get('agentic_config') or {}
+            mode = str(config.get('workspace_permission_mode') or '').strip()
+            if not mode:
+                source = next((
+                    item for item in (config.get('local_fs_sources') or [])
+                    if isinstance(item, dict) and item.get('workspace_id')
+                ), {})
+                mode = str(source.get('workspace_permission_mode') or 'ask_as_needed')
+            approved = config.get('approved_connected_app_tools') or []
+            if mode == 'always_ask' and tool_name not in approved:
+                raise ToolExecutionError.approval_required(
+                    f'Connected app operation {tool_name!r} requires approval for this operation.'
+                )
+        except ImportError:
+            pass
         missing_params: Set[str] = set(required) - set(kwargs.keys())
         if missing_params:
             LOG.warning(f'Missing required parameters: {missing_params}')

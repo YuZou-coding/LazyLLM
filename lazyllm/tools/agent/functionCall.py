@@ -19,6 +19,7 @@ from lazyllm.tools.sandbox.sandbox_base import LazyLLMSandboxBase, create_sandbo
 import re
 import json
 import inspect
+import uuid
 
 FC_PROMPT = f'''# Tools
 
@@ -49,6 +50,16 @@ class StreamResponse():
 
 
 _ROUND_TOOLS_KEY = '_function_call_round_tools'
+
+
+def _strip_model_tool_permissions(tool_calls):
+    """A model can request approval, but cannot grant approval to itself."""
+    for tool_call in tool_calls:
+        function = tool_call.get('function') if isinstance(tool_call, dict) else None
+        arguments = function.get('arguments') if isinstance(function, dict) else None
+        if isinstance(arguments, dict) and 'allow_unsafe' in arguments:
+            arguments['allow_unsafe'] = False
+    return tool_calls
 
 
 def _structured_compact_parts(compacted: Any) -> Optional[tuple]:
@@ -343,6 +354,111 @@ class FunctionCall(ModuleBase):
         self._notify_history_ready(workspace, current_round, compacted_prior)
         return input
 
+    def _resolve_tool_approvals(self, tool_calls, results):
+        resolved = list(results)
+        for index, (tool_call, result) in enumerate(zip(tool_calls, resolved)):
+            if not (
+                isinstance(result, dict) and result.get('ok') is False and
+                result.get('needs_approval') is True
+            ):
+                continue
+            function = tool_call.get('function') or {}
+            tool_name = str(function.get('name') or '')
+            arguments = function.get('arguments')
+            if not isinstance(arguments, dict):
+                continue
+            agentic_config = lazyllm_globals.get('agentic_config') or {}
+            permission_mode = str(agentic_config.get('workspace_permission_mode') or '')
+            if not permission_mode:
+                source = next((
+                    item for item in (agentic_config.get('local_fs_sources') or [])
+                    if isinstance(item, dict) and item.get('workspace_id')
+                ), {})
+                permission_mode = str(
+                    source.get('workspace_permission_mode') or 'ask_as_needed'
+                )
+            auto_allow = permission_mode == 'allow_all'
+            tool_limit_decision_coordinator = None
+            if not auto_allow:
+                try:
+                    from lazymind.chat.engine.agent_runtime.tool_limit_control import (
+                        tool_limit_decision_coordinator,
+                    )
+                except ImportError:
+                    continue
+            decision_id = uuid.uuid4().hex
+            sid = lazyllm_globals._sid
+            if tool_limit_decision_coordinator is not None:
+                tool_limit_decision_coordinator._register(sid, decision_id)
+            try:
+                safe_command = str(arguments.get('command') or arguments.get('cmd') or '')
+                safe_path = str(arguments.get('filepath') or arguments.get('path') or '')
+                if auto_allow:
+                    action = 'allow_once'
+                else:
+                    tool_limit_decision_coordinator._wait_until_active(sid, decision_id)
+                    _write_agent_data(
+                        'tool_limit_pending',
+                        decision_id=decision_id,
+                        approval_kind='tool',
+                        tool_name=tool_name,
+                        command=safe_command,
+                        path=safe_path,
+                        cwd=str(arguments.get('cwd') or '.'),
+                        reason=str(result.get('value') or ''),
+                        used_rounds=0,
+                        round_limit=0,
+                        expanded_max_rounds=0,
+                        timeout_seconds=600,
+                    )
+                    action = tool_limit_decision_coordinator._wait_for_action(decision_id, 600)
+                if action != 'allow_once':
+                    resolved[index] = {
+                        'ok': False,
+                        'value': 'The user denied or did not approve this operation.',
+                    }
+                    continue
+                approved_call = dict(tool_call)
+                approved_function = dict(function)
+                approved_arguments = dict(arguments)
+                sensitive_path = str(
+                    approved_arguments.get('filepath') or approved_arguments.get('path') or ''
+                )
+                prior_sensitive = list(agentic_config.get('approved_sensitive_paths') or [])
+                prior_workspace_writes = list(
+                    agentic_config.get('approved_workspace_write_paths') or []
+                )
+                prior_connected_apps = list(
+                    agentic_config.get('approved_connected_app_tools') or []
+                )
+                if safe_command:
+                    approved_arguments['allow_unsafe'] = True
+                elif sensitive_path:
+                    agentic_config['approved_sensitive_paths'] = prior_sensitive + [sensitive_path]
+                    agentic_config['approved_workspace_write_paths'] = (
+                        prior_workspace_writes + [sensitive_path]
+                    )
+                else:
+                    agentic_config['approved_connected_app_tools'] = (
+                        prior_connected_apps + [tool_name]
+                    )
+                approved_function['arguments'] = approved_arguments
+                approved_call['function'] = approved_function
+                try:
+                    resolved[index] = self._tools_manager(
+                        [approved_call], allowed_tool_names=self._get_visible_tool_names(),
+                    )[0]
+                finally:
+                    if sensitive_path and not safe_command:
+                        agentic_config['approved_sensitive_paths'] = prior_sensitive
+                        agentic_config['approved_workspace_write_paths'] = prior_workspace_writes
+                    if not sensitive_path and not safe_command:
+                        agentic_config['approved_connected_app_tools'] = prior_connected_apps
+            finally:
+                if tool_limit_decision_coordinator is not None:
+                    tool_limit_decision_coordinator._unregister(sid, decision_id)
+        return resolved
+
     def _post_action(self, llm_output: Dict[str, Any]):  # noqa: C901
         if not llm_output.get('tool_calls'):
             if (match := re.search(r'Action:\s*Call\s+(\w+)\s+with\s+parameters\s+(\{.*?\})', llm_output['content'])):
@@ -354,6 +470,7 @@ class FunctionCall(ModuleBase):
         if tool_calls := llm_output.get('tool_calls'):
             if isinstance(tool_calls, list): [item.pop('index', None) for item in tool_calls]
             tool_calls = self._tools_manager.normalize_tool_calls(tool_calls)
+            tool_calls = _strip_model_tool_permissions(tool_calls)
             llm_output['tool_calls'] = tool_calls
             if self._stream:
                 _write_agent_data('tool_calls', tool_calls=tool_calls)
@@ -361,6 +478,7 @@ class FunctionCall(ModuleBase):
                 tool_calls,
                 allowed_tool_names=self._get_visible_tool_names(),
             )
+            tool_calls_results = self._resolve_tool_approvals(tool_calls, tool_calls_results)
             if self._stream:
                 _write_agent_data('tool_results',
                                   tool_results=LazyLLMAgentBase._normalize_tool_results(tool_calls,
